@@ -6,6 +6,7 @@ import type { ChatMessage } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { contentToString } from '../lib/content.js';
 
 import { classifyRequest } from '../services/judge.js';
 import { getPreferredModelIds } from '../services/routerConfig.js';
@@ -103,25 +104,39 @@ const toolCallSchema = z.object({
   thought_signature: z.string().optional(),
 });
 
+// OpenAI multimodal envelope. Clients like opencode / continue.dev send
+// content as an array of typed blocks even when only text is present. We
+// accept the envelope on the wire and flatten to string for providers that
+// don't support arrays (Cohere, Cloudflare). Non-text blocks pass z validation
+// but get dropped by contentToString — vision/audio still isn't supported.
+const contentBlockSchema = z.object({ type: z.string() }).passthrough();
+const contentSchema = z.union([z.string(), z.array(contentBlockSchema)]);
+
+function hasNonEmptyContent(content: unknown): boolean {
+  if (typeof content === 'string') return content.length > 0;
+  if (Array.isArray(content)) return content.length > 0;
+  return false;
+}
+
 const systemMessageSchema = z.object({
   role: z.literal('system'),
-  content: z.string(),
+  content: contentSchema,
   name: z.string().optional(),
 });
 
 const userMessageSchema = z.object({
   role: z.literal('user'),
-  content: z.string(),
+  content: contentSchema,
   name: z.string().optional(),
 });
 
 const assistantMessageSchema = z.object({
   role: z.literal('assistant'),
-  content: z.string().nullable().optional(),
+  content: z.union([contentSchema, z.null()]).optional(),
   name: z.string().optional(),
   tool_calls: z.array(toolCallSchema).optional(),
 }).refine((msg) => {
-  const hasContent = typeof msg.content === 'string' && msg.content.length > 0;
+  const hasContent = hasNonEmptyContent(msg.content);
   const hasToolCalls = (msg.tool_calls?.length ?? 0) > 0;
   return hasContent || hasToolCalls;
 }, {
@@ -130,7 +145,7 @@ const assistantMessageSchema = z.object({
 
 const toolMessageSchema = z.object({
   role: z.literal('tool'),
-  content: z.string(),
+  content: contentSchema,
   tool_call_id: z.string().min(1),
   name: z.string().optional(),
 });
@@ -172,14 +187,22 @@ const chatCompletionSchema = z.object({
   parallel_tool_calls: z.boolean().optional(),
 });
 
-function isRetryableError(err: any): boolean {
+export function isRetryableError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
   return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
     || msg.includes('quota') || msg.includes('resource_exhausted')
     || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('503') || msg.includes('unavailable')
-    || msg.includes('500') || msg.includes('internal server error');
+    || msg.includes('500') || msg.includes('internal server error')
+    // 413: this model's payload limit is too small for the request, but another
+    // provider in the fallback chain may have a larger limit. Same reasoning as 503.
+    || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
+    || msg.includes('request entity too large') || msg.includes('content too large')
+    // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
+    // for a model that's been pulled). Rotate to the next model in the chain —
+    // setCooldown + the health checker will avoid this model on subsequent requests.
+    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found');
 }
 
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
@@ -238,8 +261,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   });
 
   const estimatedInputTokens = messages.reduce((sum, m) => {
-    if (typeof m.content !== 'string') return sum;
-    return sum + Math.ceil(m.content.length / 4);
+    const text = contentToString(m.content);
+    return sum + Math.ceil(text.length / 4);
   }, 0);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
 
