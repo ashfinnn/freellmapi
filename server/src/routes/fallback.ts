@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { getAllPenalties } from '../services/router.js';
+import { getAllPenalties } from '../services/router-og.js';
 
 export const fallbackRouter = Router();
 

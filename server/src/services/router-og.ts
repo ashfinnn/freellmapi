@@ -44,14 +44,19 @@ export interface RouteResult {
 // Round-robin index per platform
 const roundRobinIndex = new Map<string, number>();
 
-// Dynamic priority: track 429s per model and demote accordingly
+// ── Dynamic priority: track 429s per model and demote accordingly ──
+// Key: model_db_id → { count, lastHit, penalty }
 const rateLimitPenalties = new Map<number, { count: number; lastHit: number; penalty: number }>();
 
-const PENALTY_PER_429 = 3;
-const MAX_PENALTY = 10;
-const DECAY_INTERVAL_MS = 2 * 60 * 1000;
-const DECAY_AMOUNT = 1;
+// Penalty decays over time so models recover
+const PENALTY_PER_429 = 3;        // each 429 adds this many priority positions
+const MAX_PENALTY = 10;            // cap so a model doesn't sink forever
+const DECAY_INTERVAL_MS = 2 * 60 * 1000; // penalty decays every 2 minutes
+const DECAY_AMOUNT = 1;            // remove this much penalty per decay interval
 
+/**
+ * Record a 429 for a model — increases its penalty so it sinks in priority.
+ */
 export function recordRateLimitHit(modelDbId: number) {
   const existing = rateLimitPenalties.get(modelDbId);
   const now = Date.now();
@@ -64,6 +69,9 @@ export function recordRateLimitHit(modelDbId: number) {
   }
 }
 
+/**
+ * Record a success for a model — reduces its penalty so it rises back up.
+ */
 export function recordSuccess(modelDbId: number) {
   const existing = rateLimitPenalties.get(modelDbId);
   if (existing) {
@@ -74,18 +82,20 @@ export function recordSuccess(modelDbId: number) {
   }
 }
 
+/**
+ * Get the current penalty for a model (with time-based decay).
+ */
 function getPenalty(modelDbId: number): number {
   const entry = rateLimitPenalties.get(modelDbId);
   if (!entry) return 0;
 
+  // Apply time-based decay
   const now = Date.now();
   const elapsed = now - entry.lastHit;
   const decaySteps = Math.floor(elapsed / DECAY_INTERVAL_MS);
-
   if (decaySteps > 0) {
     entry.penalty = Math.max(0, entry.penalty - (decaySteps * DECAY_AMOUNT));
-    entry.lastHit = now;
-
+    entry.lastHit = now; // reset so we don't double-decay
     if (entry.penalty === 0) {
       rateLimitPenalties.delete(modelDbId);
       return 0;
@@ -95,6 +105,9 @@ function getPenalty(modelDbId: number): number {
   return entry.penalty;
 }
 
+/**
+ * Get current penalties for all models (for the API/dashboard).
+ */
 export function getAllPenalties(): Array<{ modelDbId: number; count: number; penalty: number }> {
   const result: Array<{ modelDbId: number; count: number; penalty: number }> = [];
   for (const [modelDbId, entry] of rateLimitPenalties) {
@@ -106,90 +119,37 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
   return result.sort((a, b) => b.penalty - a.penalty);
 }
 
-function reorderByPreferredModelIds(
-  chain: Array<FallbackRow & { effectivePriority: number }>,
-  preferredModelIds?: string[],
-): Array<FallbackRow & { effectivePriority: number }> {
-  if (!preferredModelIds?.length) return chain;
-
-  const db = getDb();
-  const allModelIds = db.prepare(`
-    SELECT id, model_id
-    FROM models
-  `).all() as { id: number; model_id: string }[];
-
-  const dbIdToModelId = new Map<number, string>();
-  for (const row of allModelIds) {
-    dbIdToModelId.set(row.id, row.model_id);
-  }
-
-  const preferredSet = new Set(preferredModelIds);
-  const preferredIndexMap = new Map(preferredModelIds.map((id, i) => [id, i]));
-
-  const preferred: Array<FallbackRow & { effectivePriority: number }> = [];
-  const rest: Array<FallbackRow & { effectivePriority: number }> = [];
-
-  for (const entry of chain) {
-    const modelId = dbIdToModelId.get(entry.model_db_id);
-    if (modelId && preferredSet.has(modelId)) {
-      preferred.push(entry);
-    } else {
-      rest.push(entry);
-    }
-  }
-
-  preferred.sort((a, b) => {
-    const aId = dbIdToModelId.get(a.model_db_id) ?? '';
-    const bId = dbIdToModelId.get(b.model_db_id) ?? '';
-    const aIdx = preferredIndexMap.get(aId) ?? Number.MAX_SAFE_INTEGER;
-    const bIdx = preferredIndexMap.get(bId) ?? Number.MAX_SAFE_INTEGER;
-    return aIdx - bIdx;
-  });
-
-  return [...preferred, ...rest];
-}
-
 /**
  * Route a request to the best available model.
+ * Models are sorted by (base_priority + rate_limit_penalty) so frequently
+ * rate-limited models automatically sink below working ones.
  *
- * Priority order (highest to lowest):
- *  1. Sticky session model (preferredModelDbId) — keeps multi-turn conversations
- *     on the same model to prevent hallucination from context switching.
- *  2. Judge-preferred models (preferredModelIds) — the LLM judge's ordered list
- *     for the classified task_type × complexity, moved to the front of the chain.
- *  3. Remaining models sorted by (base_priority + rate_limit_penalty).
+ * If preferredModelDbId is set, that model gets tried FIRST (sticky sessions).
+ * This prevents hallucination from model switching mid-conversation.
  *
- * @param estimatedTokens    estimated total tokens for rate limit check
- * @param skipKeys           "platform:modelId:keyId" entries to skip (failed this request)
- * @param preferredModelDbId sticky session model db id — tried before anything else
- * @param preferredModelIds  judge-ordered model_id list — reorders the fallback chain
+ * @param estimatedTokens - estimated total tokens for rate limit check
+ * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
+ * @param preferredModelDbId - try this model first (sticky session)
  */
-export function routeRequest(
-  estimatedTokens = 1000,
-  skipKeys?: Set<string>,
-  preferredModelDbId?: number,
-  preferredModelIds?: string[],
-): RouteResult {
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number): RouteResult {
   const db = getDb();
 
+  // Get fallback chain ordered by priority
   const fallbackChain = db.prepare(`
     SELECT fc.model_db_id, fc.priority, fc.enabled
     FROM fallback_config fc
     ORDER BY fc.priority ASC
   `).all() as FallbackRow[];
 
-  let sortedChain = fallbackChain
-    .map((entry) => ({
-      ...entry,
-      effectivePriority: entry.priority + getPenalty(entry.model_db_id),
-    }))
-    .sort((a, b) => a.effectivePriority - b.effectivePriority);
+  // Apply dynamic penalties: sort by (base priority + penalty)
+  const sortedChain = fallbackChain.map(entry => ({
+    ...entry,
+    effectivePriority: entry.priority + getPenalty(entry.model_db_id),
+  })).sort((a, b) => a.effectivePriority - b.effectivePriority);
 
-  sortedChain = reorderByPreferredModelIds(sortedChain, preferredModelIds);
-
-  // Sticky session: move preferred model to front of chain (overrides judge)
+  // Sticky session: move preferred model to front of chain
   if (preferredModelDbId) {
-    const idx = sortedChain.findIndex((e) => e.model_db_id === preferredModelDbId);
+    const idx = sortedChain.findIndex(e => e.model_db_id === preferredModelDbId);
     if (idx > 0) {
       const [preferred] = sortedChain.splice(idx, 1);
       sortedChain.unshift(preferred);
@@ -199,21 +159,22 @@ export function routeRequest(
   for (const entry of sortedChain) {
     if (!entry.enabled) continue;
 
-    const model = db
-      .prepare('SELECT * FROM models WHERE id = ? AND enabled = 1')
-      .get(entry.model_db_id) as ModelRow | undefined;
-
+    // Get model details
+    const model = db.prepare('SELECT * FROM models WHERE id = ? AND enabled = 1').get(entry.model_db_id) as ModelRow | undefined;
     if (!model) continue;
 
+    // Check if we have a provider for this platform
     const provider = getProvider(model.platform as any);
     if (!provider) continue;
 
+    // Get all healthy, enabled keys for this platform
     const keys = db.prepare(
       'SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status != ?'
     ).all(model.platform, 'invalid') as KeyRow[];
 
     if (keys.length === 0) continue;
 
+    // Get limits once for this model
     const limits = {
       rpm: model.rpm_limit,
       rpd: model.rpd_limit,
@@ -221,6 +182,7 @@ export function routeRequest(
       tpd: model.tpd_limit,
     };
 
+    // Try all keys for this model before giving up on it
     const rrKey = `${model.platform}:${model.model_id}`;
     let idx = roundRobinIndex.get(rrKey) ?? 0;
 
@@ -231,12 +193,14 @@ export function routeRequest(
       const skipId = `${model.platform}:${model.model_id}:${key.id}`;
       if (skipKeys?.has(skipId)) continue;
 
+      // Check cooldown (from previous 429s)
       if (isOnCooldown(model.platform, model.model_id, key.id)) continue;
+
       if (!canMakeRequest(model.platform, model.model_id, key.id, limits)) continue;
       if (!canUseTokens(model.platform, model.model_id, key.id, estimatedTokens, limits)) continue;
 
+      // We found a working key for this model!
       roundRobinIndex.set(rrKey, idx);
-
       const decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
 
       return {
@@ -250,7 +214,13 @@ export function routeRequest(
       };
     }
 
+    // If we reach here, this specific model has NO available keys.
+    // Update round-robin index even if we failed so we don't get stuck.
     roundRobinIndex.set(rrKey, idx);
+    
+    // We don't explicitly penalize the model here because the fact that we 
+    // couldn't find a key means we will naturally move to the next model 
+    // in the `sortedChain` for THIS specific request.
   }
 
   const err = new Error('All models exhausted. Add more API keys or wait for rate limits to reset.') as any;

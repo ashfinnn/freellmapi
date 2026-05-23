@@ -3,32 +3,46 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router-og.js';
 import { recordRequest, recordTokens, setCooldown } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 
-import { classifyRequest } from '../services/judge.js';
-import { getPreferredModelIds } from '../services/routerConfig.js';
-
 export const proxyRouter = Router();
 
+// Virtual "auto" model. Clients like Hermes require a non-empty `model` field
+// on every request, but freellmapi's whole point is to pick the model itself.
+// Requesting this id means "let the router decide" — identical to omitting
+// `model` entirely.
 const AUTO_MODEL_ID = 'auto';
 
 function isAutoModel(modelId: string | undefined): boolean {
   return modelId === AUTO_MODEL_ID;
 }
 
+// Constant-time string comparison for the unified API key. Plain `===` leaks
+// length and per-character timing, which a network attacker could in principle
+// use to recover the key one byte at a time.
 function timingSafeStringEqual(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
+  // Compare against a same-length buffer regardless of input length so the
+  // comparison itself runs in constant time; the explicit length check at the
+  // end is what actually decides equality when lengths differ.
   const compareA = a.length === b.length ? a : Buffer.alloc(b.length);
   return crypto.timingSafeEqual(compareA, b) && a.length === b.length;
 }
 
+// Sticky sessions: track which model served each "session"
+// Key: hash of first user message → model_db_id
+// This prevents model switching mid-conversation which causes hallucination
 const stickySessionMap = new Map<string, { modelDbId: number; lastUsed: number }>();
-const STICKY_TTL_MS = 30 * 60 * 1000;
+const STICKY_TTL_MS = 30 * 60 * 1000; // 30 min session TTL
 
 function getSessionKey(messages: ChatMessage[]): string {
+  // Use the first user message as session identifier — clients like Hermes
+  // re-send the full conversation each turn, so the first user message is
+  // stable across turns. Hash the FULL message (not a 100-char slice) so
+  // distinct conversations with identical openings don't collide.
   const firstUser = messages.find(m => m.role === 'user');
   if (!firstUser || typeof firstUser.content !== 'string') return '';
   const hash = crypto.createHash('sha1').update(firstUser.content).digest('hex');
@@ -36,6 +50,7 @@ function getSessionKey(messages: ChatMessage[]): string {
 }
 
 function getStickyModel(messages: ChatMessage[]): number | undefined {
+  // Only apply sticky for multi-turn (has assistant messages = continuation)
   const hasAssistant = messages.some(m => m.role === 'assistant');
   if (!hasAssistant) return undefined;
 
@@ -57,6 +72,7 @@ function setStickyModel(messages: ChatMessage[], modelDbId: number) {
   if (!key) return;
   stickySessionMap.set(key, { modelDbId, lastUsed: Date.now() });
 
+  // Cleanup old entries
   if (stickySessionMap.size > 500) {
     const now = Date.now();
     for (const [k, v] of stickySessionMap) {
@@ -65,6 +81,7 @@ function setStickyModel(messages: ChatMessage[], modelDbId: number) {
   }
 }
 
+// OpenAI-compatible /models endpoint (used by Hermes for metadata)
 proxyRouter.get('/models', (_req: Request, res: Response) => {
   const db = getDb();
   const models = db.prepare('SELECT platform, model_id, display_name, context_window FROM models WHERE enabled = 1 ORDER BY intelligence_rank').all() as any[];
@@ -185,6 +202,9 @@ function isRetryableError(err: any): boolean {
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
 
+  // Authenticate with the unified API key for every proxy request, including
+  // loopback callers. Browser pages can reach localhost, so socket locality is
+  // not a reliable authorization boundary.
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
   const unifiedKey = getUnifiedApiKey();
   if (!token || !timingSafeStringEqual(token, unifiedKey)) {
@@ -194,6 +214,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
+  // Validate request
   const parsed = chatCompletionSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({
@@ -237,30 +258,26 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     };
   });
 
+  // Token estimation is intentionally a heuristic (~4 chars per token). Used
+  // for routing decisions (skip a model whose budget is too small) and for
+  // streaming bookkeeping where the provider doesn't echo a final usage count.
+  // Non-streaming requests reconcile against the provider's real `usage` block
+  // (see line ~340). Streaming will drift from real consumption — accepted
+  // tradeoff because per-request usage isn't always returned mid-stream.
   const estimatedInputTokens = messages.reduce((sum, m) => {
     if (typeof m.content !== 'string') return sum;
     return sum + Math.ceil(m.content.length / 4);
   }, 0);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
 
+  // Explicit `model` field pins routing. If the catalog has no enabled row
+  // matching the requested id, return 400 — silently auto-routing to a
+  // different model would be surprising to OpenAI-compatible clients.
+  // Sticky-session is the fallback when no `model` field was sent at all.
   let preferredModel: number | undefined;
-  let judgePreferredModelIds: string[] | undefined;
-
-  if (isAutoModel(requestedModel) || !requestedModel) {
+  if (isAutoModel(requestedModel)) {
+    // Explicit "auto" → behave exactly like an omitted model field.
     preferredModel = getStickyModel(messages);
-
-    // ── LLM Judge routing ──────────────────────────────────────────────────
-    // Only classify new conversations — sticky sessions already have a pinned
-    // model and don't need re-classification.
-    if (!preferredModel) {
-      const judgment = await classifyRequest(messages);
-      if (judgment) {
-        judgePreferredModelIds = getPreferredModelIds(judgment.task_type, judgment.complexity);
-        console.log(`[Judge] task=${judgment.task_type} complexity=${judgment.complexity} -> ${judgePreferredModelIds.slice(0, 2).join(', ')}...`);
-      }
-    }
-    // ── End LLM Judge routing ──────────────────────────────────────────────
-
   } else if (requestedModel) {
     const db = getDb();
     const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
@@ -278,21 +295,20 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       });
       return;
     }
+  } else {
+    preferredModel = getStickyModel(messages);
   }
 
+  // Retry loop: on 429/rate limit, skip that model+key and try the next one
   const skipKeys = new Set<string>();
   let lastError: any = null;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(
-        estimatedTotal,
-        skipKeys.size > 0 ? skipKeys : undefined,
-        preferredModel,
-        judgePreferredModelIds,
-      );
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel);
     } catch (err: any) {
+      // No more models available
       if (lastError) {
         res.status(429).json({
           error: {
@@ -312,6 +328,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
     try {
       if (stream) {
+        // Lazy header set: pre-stream errors stay retryable (no headers sent yet);
+        // mid-stream errors emit an `error` SSE frame so the client sees a real signal
+        // instead of a silently truncated stream.
         let totalOutputTokens = 0;
         let streamStarted = false;
         try {
@@ -326,7 +345,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               res.setHeader('Cache-Control', 'no-cache');
               res.setHeader('Connection', 'keep-alive');
               res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-              res.setHeader('X-Judge-Route', judgePreferredModelIds?.[0] ?? '');
               if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
               streamStarted = true;
             }
@@ -336,9 +354,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
 
           if (!streamStarted) {
+            // Upstream returned no chunks — emit minimal successful stream.
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-            res.setHeader('X-Judge-Route', judgePreferredModelIds?.[0] ?? '');
           }
           res.write('data: [DONE]\n\n');
           res.end();
@@ -350,6 +368,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           return;
         } catch (streamErr: any) {
           if (streamStarted) {
+            // Mid-stream error — finish the SSE response cleanly instead of leaving
+            // the client hanging or letting Express's default handler take over.
+            // Full upstream message goes to the log; the client sees a generic
+            // message so we don't leak provider internals into a partial stream.
             console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, streamErr.message);
             const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
@@ -357,6 +379,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, streamErr.message);
             return;
           }
+          // Pre-stream error — bubble to outer retry/502 handler.
           throw streamErr;
         }
       } else {
@@ -371,7 +394,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         setStickyModel(messages, route.modelDbId);
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-        res.setHeader('X-Judge-Route', judgePreferredModelIds?.[0] ?? '');
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
         res.json(result);
 
@@ -388,6 +410,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, 'error', estimatedInputTokens, 0, latency, err.message);
 
       if (isRetryableError(err)) {
+        // Put this model+key on cooldown and try the next one
         const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
         skipKeys.add(skipId);
         setCooldown(route.platform, route.modelId, route.keyId, 120_000);
@@ -397,6 +420,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         continue;
       }
 
+      // Non-retryable error (auth, 4xx, etc.): don't retry
       res.status(502).json({
         error: {
           message: `Provider error (${route.displayName}): ${err.message}`,
@@ -407,6 +431,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     }
   }
 
+  // Exhausted all retries
   res.status(429).json({
     error: {
       message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
