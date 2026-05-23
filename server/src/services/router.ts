@@ -44,7 +44,7 @@ export interface RouteResult {
 // Round-robin index per platform
 const roundRobinIndex = new Map<string, number>();
 
-// Dynamic priority: track 429s per model and demote accordingly
+// ── Dynamic priority: track 429s per model and demote accordingly ──
 const rateLimitPenalties = new Map<number, { count: number; lastHit: number; penalty: number }>();
 
 const PENALTY_PER_429 = 3;
@@ -81,11 +81,9 @@ function getPenalty(modelDbId: number): number {
   const now = Date.now();
   const elapsed = now - entry.lastHit;
   const decaySteps = Math.floor(elapsed / DECAY_INTERVAL_MS);
-
   if (decaySteps > 0) {
     entry.penalty = Math.max(0, entry.penalty - (decaySteps * DECAY_AMOUNT));
     entry.lastHit = now;
-
     if (entry.penalty === 0) {
       rateLimitPenalties.delete(modelDbId);
       return 0;
@@ -104,49 +102,6 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
     }
   }
   return result.sort((a, b) => b.penalty - a.penalty);
-}
-
-function reorderByPreferredModelIds(
-  chain: Array<FallbackRow & { effectivePriority: number }>,
-  preferredModelIds?: string[],
-): Array<FallbackRow & { effectivePriority: number }> {
-  if (!preferredModelIds?.length) return chain;
-
-  const db = getDb();
-  const allModelIds = db.prepare(`
-    SELECT id, model_id
-    FROM models
-  `).all() as { id: number; model_id: string }[];
-
-  const dbIdToModelId = new Map<number, string>();
-  for (const row of allModelIds) {
-    dbIdToModelId.set(row.id, row.model_id);
-  }
-
-  const preferredSet = new Set(preferredModelIds);
-  const preferredIndexMap = new Map(preferredModelIds.map((id, i) => [id, i]));
-
-  const preferred: Array<FallbackRow & { effectivePriority: number }> = [];
-  const rest: Array<FallbackRow & { effectivePriority: number }> = [];
-
-  for (const entry of chain) {
-    const modelId = dbIdToModelId.get(entry.model_db_id);
-    if (modelId && preferredSet.has(modelId)) {
-      preferred.push(entry);
-    } else {
-      rest.push(entry);
-    }
-  }
-
-  preferred.sort((a, b) => {
-    const aId = dbIdToModelId.get(a.model_db_id) ?? '';
-    const bId = dbIdToModelId.get(b.model_db_id) ?? '';
-    const aIdx = preferredIndexMap.get(aId) ?? Number.MAX_SAFE_INTEGER;
-    const bIdx = preferredIndexMap.get(bId) ?? Number.MAX_SAFE_INTEGER;
-    return aIdx - bIdx;
-  });
-
-  return [...preferred, ...rest];
 }
 
 /**
@@ -172,24 +127,75 @@ export function routeRequest(
 ): RouteResult {
   const db = getDb();
 
+  // Get fallback chain ordered by priority
   const fallbackChain = db.prepare(`
     SELECT fc.model_db_id, fc.priority, fc.enabled
     FROM fallback_config fc
     ORDER BY fc.priority ASC
   `).all() as FallbackRow[];
 
-  let sortedChain = fallbackChain
-    .map((entry) => ({
-      ...entry,
-      effectivePriority: entry.priority + getPenalty(entry.model_db_id),
-    }))
-    .sort((a, b) => a.effectivePriority - b.effectivePriority);
+  // Apply dynamic penalties: sort by (base priority + penalty)
+  const sortedChain = fallbackChain.map(entry => ({
+    ...entry,
+    effectivePriority: entry.priority + getPenalty(entry.model_db_id),
+  })).sort((a, b) => a.effectivePriority - b.effectivePriority);
 
-  sortedChain = reorderByPreferredModelIds(sortedChain, preferredModelIds);
+  // ── Judge-based reordering ────────────────────────────────────────────────
+  // Batch-fetch all model_ids in one query to avoid N+1 per entry.
+  if (preferredModelIds && preferredModelIds.length > 0) {
+    // Config entries are "platform/model_id" format (e.g. "groq/llama-3.1-8b-instant").
+    // Build a lookup key of the same format from the DB so matching is unambiguous.
+    const allModels = db.prepare(`
+      SELECT id, platform, model_id FROM models
+    `).all() as { id: number; platform: string; model_id: string }[];
+
+    const dbIdToKey = new Map<number, string>();
+    for (const row of allModels) {
+      dbIdToKey.set(row.id, row.platform + '/' + row.model_id);
+    }
+
+    // Support both "platform/model_id" (new) and bare "model_id" (legacy) in config.
+    // For bare entries, match any platform that has that model_id.
+    const preferredSet = new Set(preferredModelIds);
+    const preferredIndexMap = new Map(preferredModelIds.map((id, i) => [id, i]));
+
+    function getMatchKey(dbKey: string, modelId: string): string | undefined {
+      // Exact platform/model_id match
+      if (preferredSet.has(dbKey)) return dbKey;
+      // Legacy bare model_id match
+      if (preferredSet.has(modelId)) return modelId;
+      return undefined;
+    }
+
+    const preferred: typeof sortedChain = [];
+    const rest: typeof sortedChain = [];
+
+    for (const entry of sortedChain) {
+      const dbKey = dbIdToKey.get(entry.model_db_id) ?? '';
+      const modelId = dbKey.split('/').slice(1).join('/');
+      const matchKey = getMatchKey(dbKey, modelId);
+      if (matchKey) {
+        preferred.push({ ...entry, _matchKey: matchKey } as any);
+      } else {
+        rest.push(entry);
+      }
+    }
+
+    // Sort preferred entries by the judge's specified order
+    preferred.sort((a: any, b: any) => {
+      const aIdx = preferredIndexMap.get(a._matchKey) ?? 999;
+      const bIdx = preferredIndexMap.get(b._matchKey) ?? 999;
+      return aIdx - bIdx;
+    });
+
+    sortedChain.length = 0;
+    sortedChain.push(...preferred, ...rest);
+  }
+  // ── End judge-based reordering ────────────────────────────────────────────
 
   // Sticky session: move preferred model to front of chain (overrides judge)
   if (preferredModelDbId) {
-    const idx = sortedChain.findIndex((e) => e.model_db_id === preferredModelDbId);
+    const idx = sortedChain.findIndex(e => e.model_db_id === preferredModelDbId);
     if (idx > 0) {
       const [preferred] = sortedChain.splice(idx, 1);
       sortedChain.unshift(preferred);
@@ -199,10 +205,7 @@ export function routeRequest(
   for (const entry of sortedChain) {
     if (!entry.enabled) continue;
 
-    const model = db
-      .prepare('SELECT * FROM models WHERE id = ? AND enabled = 1')
-      .get(entry.model_db_id) as ModelRow | undefined;
-
+    const model = db.prepare('SELECT * FROM models WHERE id = ? AND enabled = 1').get(entry.model_db_id) as ModelRow | undefined;
     if (!model) continue;
 
     const provider = getProvider(model.platform as any);
@@ -236,7 +239,6 @@ export function routeRequest(
       if (!canUseTokens(model.platform, model.model_id, key.id, estimatedTokens, limits)) continue;
 
       roundRobinIndex.set(rrKey, idx);
-
       const decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
 
       return {
