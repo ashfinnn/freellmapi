@@ -180,7 +180,17 @@ export async function classifyRequest(messages: ChatMessage[]): Promise<JudgeRes
       ),
     ]);
 
-    const raw = result.choices?.[0]?.message?.content ?? '';
+    const rawContent = result.choices?.[0]?.message?.content ?? '';
+    // Normalize content which may be a string or an array of content blocks
+    let raw: string;
+    if (typeof rawContent === 'string') {
+      raw = rawContent;
+    } else if (Array.isArray(rawContent)) {
+      raw = rawContent.map(block => typeof block === 'string' ? block : (block as any)?.content ?? JSON.stringify(block)).join('\n');
+    } else {
+      raw = String(rawContent);
+    }
+
     console.log('[Judge] raw response:', raw, 'model:', model.platform + '/' + model.model_id);
     // Strip markdown fences if the model ignored instructions
     const cleaned = raw.replace(/```(?:json)?/g, '').trim();

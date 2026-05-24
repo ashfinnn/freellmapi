@@ -1,160 +1,138 @@
 {
   "coding": {
     "simple": [
-      "codestral-latest",
-      "llama-3.1-8b-instant",
+      "codestral",
+      "qwen3-coder-free",
       "gpt-oss-20b",
-      "openai/gpt-oss-20b:free",
-      "llama3.1-8b",
-      "qwen/qwen3-coder:free",
-      "gpt-oss-120b"
+      "glm-4.7-flash",
+      "llama-3.1-8b-instant"
     ],
     "medium": [
+      "deepseek-v3.2",
       "gpt-oss-120b",
-      "codestral-latest",
-      "DeepSeek-V3.2",
-      "DeepSeek-V3.1",
-      "openai/gpt-oss-120b:free",
-      "qwen/qwen3-coder:free"
+      "codestral",
+      "glm-4.7",
+      "qwen3-32b-groq",
+      "llama-3.3-70b"
     ],
     "hard": [
-      "qwen3-coder:480b",
-      "DeepSeek-V3.2",
-      "DeepSeek-V3.1",
+      "deepseek-v3.2",
       "gpt-oss-120b",
-      "openai/gpt-oss-120b:free",
-      "qwen/qwen3-coder:free"
+      "qwen3-coder-480b",
+      "cogito-2.1-671b",
+      "kimi-k2-thinking"
     ]
   },
   "reasoning": {
     "simple": [
-      "llama-3.1-8b-instant",
+      "glm-4.7-flash",
       "gpt-oss-20b",
-      "gemini-2.5-flash-lite",
-      "ministral-8b-2512",
-      "GLM-4.6V-Flash",
-      "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-      "llama3.1-8b",
-      "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+      "command-r-plus-08-2024",
+      "glm-4.5-flash",
+      "llama-3.1-8b-instant"
     ],
     "medium": [
-      "llama-3.3-70b-versatile",
-      "Meta-Llama-3.3-70B-Instruct",
-      "gemini-2.5-flash",
-      "DeepSeek-V3.2",
-      "DeepSeek-V3.1",
-      "mistral-medium-latest",
-      "qwen/qwen3-next-80b-a3b-instruct:free"
+      "deepseek-v3.2",
+      "llama-3.3-70b",
+      "mistral-medium-3.5",
+      "qwen3-next-80b-free"
     ],
     "hard": [
-      "cogito-2.1:671b",
-      "deepseek-ai/deepseek-v4-pro",
-      "qwen-3-235b-a22b-instruct-2507",
-      "nvidia/nemotron-3-super-120b-a12b:free",
-      "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
-      "DeepSeek-V3.2"
+      "qwen3-235b",
+      "cogito-2.1-671b",
+      "deepseek-v3.2",
+      "kimi-k2-thinking",
+      "gpt-oss-120b"
     ]
   },
   "creative": {
     "simple": [
-      "gemini-2.5-flash-lite",
-      "llama-3.3-70b-versatile",
-      "Meta-Llama-3.3-70B-Instruct",
-      "llama-3.1-8b-instant",
-      "llama3.1-8b",
-      "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+      "llama-3.3-70b",
+      "command-r-plus-08-2024",
+      "glm-4.5-flash",
+      "gemma-4-31b-free",
+      "llama-3.1-8b-instant"
     ],
     "medium": [
-      "mistral-large-latest",
-      "gemini-2.5-flash",
-      "mistral-medium-latest",
-      "Meta-Llama-3.3-70B-Instruct",
-      "llama-3.3-70b-versatile"
+      "mistral-large-3",
+      "minimax-m2.5-free",
+      "mistral-medium-3.5",
+      "glm-4.7",
+      "llama-3.3-70b"
     ],
     "hard": [
-      "mistral-large-3:675b",
-      "mistralai/mistral-large-3-675b-instruct-2512",
-      "gemini-3.1-pro-preview",
-      "minimax/minimax-m2.5:free",
-      "mistral-large-latest"
+      "mistral-large-3-675b",
+      "minimax-m2.5-free",
+      "qwen3-235b",
+      "kimi-k2-thinking",
+      "mistral-large-3"
     ]
   },
   "factual": {
     "simple": [
-      "llama-3.1-8b-instant",
-      "gemini-2.5-flash-lite",
-      "GLM-4.6V-Flash",
+      "glm-4.7-flash",
+      "glm-4.5-flash",
+      "command-r-plus-08-2024",
       "gpt-oss-20b",
-      "openai/gpt-oss-20b:free",
-      "ministral-8b-2512",
-      "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-      "llama3.1-8b",
-      "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-      "llama-3.3-70b-versatile"
+      "llama-3.1-8b-instant"
     ],
     "medium": [
-      "gemini-2.5-flash",
-      "llama-3.3-70b-versatile",
-      "Meta-Llama-3.3-70B-Instruct",
-      "mistral-medium-latest",
-      "meta-llama/llama-3.3-70b-instruct:free"
+      "glm-4.7",
+      "deepseek-v3.2",
+      "mistral-medium-3.5",
+      "llama-3.3-70b"
     ],
     "hard": [
-      "gemini-3-flash-preview",
-      "minimax/minimax-m2.5:free",
-      "@cf/moonshotai/kimi-k2.5",
-      "gemini-2.5-flash"
+      "kimi-k2-thinking",
+      "qwen3-235b",
+      "gpt-oss-120b",
+      "deepseek-v3.2",
+      "minimax-m2.5-free"
     ]
   },
   "summarization": {
     "simple": [
-      "llama-3.1-8b-instant",
-      "gemini-2.5-flash-lite",
+      "glm-4.5-flash",
       "gpt-oss-20b",
-      "openai/gpt-oss-20b:free",
-      "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-      "llama3.1-8b",
-      "llama-3.3-70b-versatile"
+      "llama-3.3-70b",
+      "gemma-4-31b-free",
+      "llama-3.1-8b-instant"
     ],
     "medium": [
-      "gemini-2.5-flash",
-      "mistral-medium-latest",
-      "mistral-large-latest",
-      "Meta-Llama-3.3-70B-Instruct",
-      "llama-3.3-70b-versatile"
+      "mistral-large-3",
+      "mistral-medium-3.5",
+      "glm-4.7",
+      "deepseek-v3.2",
+      "llama-3.3-70b"
     ],
     "hard": [
-      "@cf/moonshotai/kimi-k2.5",
-      "gemini-3-flash-preview",
-      "minimax/minimax-m2.5:free",
       "kimi-k2-thinking",
+      "qwen3-235b",
+      "minimax-m2.5-free",
+      "gpt-oss-120b",
       "deepseek-v3.2"
     ]
   },
   "chat": {
     "simple": [
-      "llama-3.1-8b-instant",
-      "gemini-2.5-flash-lite",
-      "GLM-4.6V-Flash",
+      "llama-3.3-70b",
+      "command-r-plus-08-2024",
+      "glm-4.5-flash",
       "gpt-oss-20b",
-      "openai/gpt-oss-20b:free",
-      "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-      "llama3.1-8b",
-      "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-      "llama-3.3-70b-versatile"
+      "llama-3.1-8b-instant"
     ],
     "medium": [
-      "gemini-2.5-flash",
-      "mistral-large-latest",
-      "llama-3.3-70b-versatile",
-      "Meta-Llama-3.3-70B-Instruct",
-      "meta-llama/llama-3.3-70b-instruct:free"
+      "mistral-large-3",
+      "glm-4.7",
+      "deepseek-v3.2",
+      "llama-3.3-70b"
     ],
     "hard": [
-      "gemini-3-flash-preview",
-      "mistral-large-latest",
-      "minimax/minimax-m2.5:free",
-      "ling-2.6-1t:free"
+      "qwen3-235b",
+      "mistral-large-3-675b",
+      "kimi-k2-thinking",
+      "minimax-m2.5-free",
+      "gpt-oss-120b"
     ]
   }
 }
